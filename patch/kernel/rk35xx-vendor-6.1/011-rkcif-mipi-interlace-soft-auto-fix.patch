@@ -1,0 +1,95 @@
+From: Nick <nick@myd-lr3576.local>
+Subject: [PATCH] media: rkcif: fix MIPI CSI-2 interlaced field detection on RK3576
+
+On RK3576, the VICAP FRAME_NUM_VC counter increments for both Frame
+Start (FS) and Frame End (FE) short packet events. This means:
+ - At FS time the counter is always odd (1, 3, 5, 7, ...)
+ - At FE time the counter is always even (2, 4, 6, 8, ...)
+
+The existing SOFT_AUTO interlace detection uses (frame_id & 0xffff) % 2
+(bit 0) to distinguish odd and even fields, but since FS always sees an
+odd counter this test never alternates, causing every frame to be
+flagged as a "bad frame".
+
+Fix by using bit 1 of the frame counter on RK3576+, which correctly
+alternates between successive fields:
+ - Field 1: counter=5 (bit1=0), Field 2: counter=7 (bit1=1), etc.
+
+Also default RK3576 MIPI paths to SOFT_AUTO mode instead of HW
+interlace, since the HW interlace mode exhibits a 1-line vertical jump
+artifact due to the same frame counter parity issue.
+
+Signed-off-by: Nick <nick@myd-lr3576.local>
+---
+ drivers/media/platform/rockchip/cif/capture.c | 30 +++++++++++++++---
+ drivers/media/platform/rockchip/cif/dev.c     |  3 +-
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -616,6 +616,24 @@ out:
+ 	return index;
+ }
+
++/*
++ * Get frame counter parity for interlaced field detection.
++ *
++ * On RK3576+, the MIPI FRAME_NUM_VC counter increments for both FS and FE
++ * events, so bit 0 always has the same value at FS time (odd) and at FE
++ * time (even). Use bit 1 instead, which correctly alternates between
++ * successive interlaced fields.
++ *
++ * On older chips (RK3568/RK3588), the counter increments once per frame,
++ * so bit 0 alternates normally.
++ */
++static inline int rkcif_get_frame_id_field(struct rkcif_device *dev, int frame_id)
++{
++	if (dev->chip_id >= CHIP_RK3576_CIF)
++		return (frame_id >> 1) & 1;
++	return (frame_id & 0xffff) % 2;
++}
++
+ static inline int rkcif_get_interlace_mode(struct rkcif_stream *stream)
+ {
+ 	if (stream->cif_fmt_in->field == V4L2_FIELD_INTERLACED) {
+@@ -10955,7 +10973,8 @@ static void rkcif_line_wake_up_interlace
+ 	else if (stream->id == 3)
+ 		frame_id = rkcif_read_register(cif_dev, CIF_REG_MIPI_FRAME_NUM_VC3);
+
+-	if ((frame_id & 0xffff) % 2 == stream->odd_frame_id) {
++	if (rkcif_get_frame_id_field(cif_dev, frame_id)
++	    == stream->odd_frame_id) {
+ 		//odd frame
+ 		if (stream->odd_frame_first)
+ 			fe_interlaced_phase = CIF_CSI_FRAME0_READY;
+@@ -11225,7 +11244,8 @@ static void rkcif_update_stream_interlac
+ 	else if (stream->id == 3)
+ 		frame_id = rkcif_read_register(cif_dev, CIF_REG_MIPI_FRAME_NUM_VC3);
+
+-	if ((frame_id & 0xffff) % 2 == stream->odd_frame_id) {
++	if (rkcif_get_frame_id_field(cif_dev, frame_id)
++	    == stream->odd_frame_id) {
+ 		//odd frame
+ 		if (stream->odd_frame_first)
+ 			fe_interlaced_phase = CIF_CSI_FRAME0_READY;
+@@ -13995,7 +14015,8 @@ static void rkcif_check_mipi_interlaced_
+ 	else if (stream->id == 3)
+ 		frame_id = rkcif_read_register(dev, CIF_REG_MIPI_FRAME_NUM_VC3);
+
+-	if ((frame_id & 0xffff) % 2 == stream->odd_frame_id) {
++	if (rkcif_get_frame_id_field(dev, frame_id)
++	    == stream->odd_frame_id) {
+ 		//odd frame
+ 		if (stream->odd_frame_first) {
+ 			fs_interlaced_phase = CIF_CSI_FRAME0_READY;
+--- a/drivers/media/platform/rockchip/cif/dev.c
++++ b/drivers/media/platform/rockchip/cif/dev.c
+@@ -2879,7 +2879,8 @@ static int rkcif_plat_probe(struct platf
+ 	INIT_LIST_HEAD(&cif_dev->effect_gain_head);
+
+-	if (cif_dev->inf_id == RKCIF_MIPI_LVDS && cif_dev->chip_id <= CHIP_RK3562_CIF)
++	if (cif_dev->inf_id == RKCIF_MIPI_LVDS &&
++	    (cif_dev->chip_id <= CHIP_RK3562_CIF || cif_dev->chip_id == CHIP_RK3576_CIF))
+ 		cif_dev->use_hw_interlace = false;
+ 	else
+ 		cif_dev->use_hw_interlace = true;

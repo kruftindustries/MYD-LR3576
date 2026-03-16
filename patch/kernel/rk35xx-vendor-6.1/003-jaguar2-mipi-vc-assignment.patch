@@ -1,0 +1,37 @@
+From: Nick <nick@local>
+Subject: [PATCH] media: jaguar2: assign MIPI CSI-2 virtual channels per input
+
+Map NVP6324 input channels to distinct MIPI CSI-2 virtual channels
+(ch0->VC0, ch1->VC1, ch2->VC2, ch3->VC3) via Bank 0x21 register 0x0E.
+
+Write the VC assignment register BEFORE enabling the MIPI TX (reg 0x44),
+so the hardware latches the VC configuration at enable time. Writing
+after enable causes the assignment to be ignored — only VC0 works.
+
+Without this, all 4 channels are multiplexed on VC0 and only one
+CIF stream ID receives frames. The rkcif driver filters by VC per
+video device node, so proper VC tagging is required for simultaneous
+multi-stream capture.
+
+---
+ drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c b/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c
+@@ -270,7 +270,14 @@ void mipi_tx_init2(int dev_num)
+ 	// MIPI setting
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x44, 0x00);
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x49, 0xF3);
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x49, 0xF0);
++
++	// Virtual channel assignment: ch0->VC0, ch1->VC1, ch2->VC2, ch3->VC3
++	// Register 0x0E bits[1:0]=0, [3:2]=1, [5:4]=2, [7:6]=3 = 0xE4
++	// Must be written BEFORE MIPI TX enable (0x44=0x02) so HW latches it
++	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x0E, 0xE4);
++	pr_info("[DRV] MIPI TX VC assignment: 0xE4 (ch0-3 -> VC0-3)\n");
++
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x44, 0x02);
+ 
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x08, 0x40);

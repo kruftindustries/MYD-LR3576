@@ -1,0 +1,270 @@
+From: Nick <nick@local>
+Subject: [PATCH] media: jaguar2: fix hot-plug detection and reinit on reconnect
+
+The NVP6324 only responds on the GPIO bit-banged I2C bus, not the
+hardware I2C adapter. The hot-plug detection functions jaguar2_no_signal()
+and jaguar2_sync() used jaguar2_read() (hardware I2C) which silently
+returns zero for all registers. Switch to gpio_i2c_read() to match
+the rest of the driver (e.g. vd_jaguar2_get_novideo). Use documented
+register 0xB0 (NOVID_1B..4B) for combined video loss status.
+
+When a camera reconnects, the hot-plug handler only bounced the MIPI
+arbiter. The decoder AFE, timing, format, and EQ registers remained
+stale, producing corrupted video. Add jaguar2_reinit_channel() to
+perform the full per-channel initialization sequence when video
+returns on a channel.
+
+Also uses jaguar2_active bitmask in the legacy arbiter bounce path
+to mask disabled channels.
+
+---
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h
+@@ -25,6 +25,7 @@
+ void jaguar2_set_mclk(unsigned int mclk);
+ void jaguar2_start(video_init_all *video_init);
+ void jaguar2_stop(void);
++void jaguar2_reinit_channel(int ch, unsigned char fmt, int input);
+ int jaguar2_init(int i2c_bus);
+ void jaguar2_exit(void);
+ 
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c
+@@ -708,8 +708,21 @@
+ 
+ void jaguar2_start(video_init_all *video_init)
+ {
++	int i;
++
+ 	down(&jaguar2_lock);
+ 	vd_set_all(video_init);
++
++	/*
++	 * Enable NOVID detection on all channels.
++	 * vd_jaguar2_single_differ_set() writes 0x00 to reg 0x18+ch,
++	 * clearing NOVID_DET_B conditions. Restore them here:
++	 * 0x13 = H_LOSS_DET | V_LOSS_DET | EX_CBAR_ON
++	 */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	for (i = 0; i < 4; i++)
++		gpio_i2c_write(jaguar2_i2c_addr[0], 0x18 + i, 0x13);
++
+ 	up(&jaguar2_lock);
+ }
+ 
+@@ -729,6 +742,37 @@
+ 	up(&jaguar2_lock);
+ }
+ 
++void jaguar2_reinit_channel(int ch, unsigned char fmt, int input)
++{
++	video_input_init video_val;
++
++	video_val.ch = ch;
++	video_val.format = fmt;
++	video_val.input = input;
++	video_val.interface = YUV_422;
++
++	down(&jaguar2_lock);
++
++	/* Re-run full per-channel decoder init (AFE, format, timing, EQ) */
++	vd_jaguar2_init_set(&video_val);
++
++	/*
++	 * Restore NOVID_DET_B for this channel (init_set clears it to 0).
++	 * 0x13 = H_LOSS_DET | V_LOSS_DET | EX_CBAR_ON
++	 */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x18 + ch, 0x13);
++
++	/* Re-configure MIPI frame options and arbiter scaling */
++	mipi_video_format_set2(&video_val);
++
++	/* Full arbiter reset and re-enable no-video pattern */
++	arb_init2(0);
++	vd_pattern_enable();
++
++	up(&jaguar2_lock);
++}
++
+ /*******************************************************************************
+  *	Description		: i2c client initial
+  *	Argurments		: void
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+@@ -622,24 +622,30 @@
+ 	struct jaguar2 *jaguar2 = to_jaguar2(sd);
+ 	struct i2c_client *client = jaguar2->client;
+ 	u8 videoloss = 0;
+-	u8 temp = 0;
+-	int ch, ret;
+ 	bool no_signal = false;
+ 
+-	jaguar2_write(client, 0xff, 0x00);
+-	for (ch = 0 ; ch < 4; ch++) {
+-		ret = jaguar2_read(client, 0xa4 + ch, &temp);
+-		if (ret < 0)
+-			dev_err(&client->dev, "Failed to read videoloss state!\n");
+-		videoloss |= (temp << ch);
++	/*
++	 * The NVP6324 only responds on the GPIO bit-banged I2C bus
++	 * (jaguar2_i2c_addr[0] = 0x62), not the hardware I2C adapter.
++	 */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	{
++		u8 rA0, rB0, rD0, r18, rF4;
++		rA0 = gpio_i2c_read(jaguar2_i2c_addr[0], 0xA0);
++		rB0 = gpio_i2c_read(jaguar2_i2c_addr[0], 0xB0);
++		rD0 = gpio_i2c_read(jaguar2_i2c_addr[0], 0xD0);
++		r18 = gpio_i2c_read(jaguar2_i2c_addr[0], 0x18);
++		rF4 = gpio_i2c_read(jaguar2_i2c_addr[0], 0xF4);
++		dev_info_ratelimited(&client->dev,
++			"regs: A0=%02x B0=%02x D0=%02x r18=%02x F4=%02x",
++			rA0, rB0, rD0, r18, rF4);
++		videoloss = rA0 & 0x0f;
+ 	}
+ 	*novid = videoloss;
+ 	dev_dbg(&client->dev, "%s: video loss status:0x%x.\n", __func__, videoloss);
+ 	if (videoloss == 0xf) {
+-		dev_dbg(&client->dev, "%s: all channels No Video detected.\n", __func__);
+ 		no_signal = true;
+ 	} else {
+-		dev_dbg(&client->dev, "%s: channel has some video detection.\n", __func__);
+ 		no_signal = false;
+ 	}
+ 	return no_signal;
+@@ -648,30 +654,19 @@
+ /* indicate N4 channel locked status */
+ static inline bool jaguar2_sync(struct v4l2_subdev *sd, u8 *lock_st)
+ {
+-	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	u8 video_lock_status = 0;
+ 	u8 temp = 0;
+-	int ch, ret;
++	int ch;
+ 	bool has_sync = false;
+ 
+-	jaguar2_write(client, 0xff, 0x00);
++	/* Bank 0x00 already selected by jaguar2_no_signal() */
+ 	for (ch = 0 ; ch < 4; ch++) {
+-		ret = jaguar2_read(client, 0xd0 + ch, &temp);
+-		if (ret < 0)
+-			dev_err(&client->dev, "Failed to read LOCK status!\n");
++		temp = gpio_i2c_read(jaguar2_i2c_addr[0], 0xd0 + ch);
+ 		video_lock_status |= (temp << ch);
+ 	}
+ 
+-	dev_dbg(&client->dev, "%s: video AGC LOCK status:0x%x.\n",
+-			__func__, video_lock_status);
+ 	*lock_st = video_lock_status;
+-	if (video_lock_status) {
+-		dev_dbg(&client->dev, "%s: channel has AGC LOCK.\n", __func__);
+-		has_sync = true;
+-	} else {
+-		dev_dbg(&client->dev, "%s: channel has no AGC LOCK.\n", __func__);
+-		has_sync = false;
+-	}
++	has_sync = !!video_lock_status;
+ 	return has_sync;
+ }
+ 
+@@ -686,6 +681,8 @@
+ 	struct v4l2_subdev *sd = &jaguar2->subdev;
+ 	u8 novid_status = 0x00;
+ 	u8 sync_status = 0x00;
++	u8 returned;
++	int ch;
+ 
+ 	down(&jaguar2->reg_sem);
+ 	jaguar2_no_signal(sd, &novid_status);
+@@ -699,34 +696,73 @@
+ 		jaguar2->hot_plug = true;
+ 	else
+ 		jaguar2->hot_plug = false;
++	/* Channels that transitioned from no-video to video-present */
++	returned = jaguar2->last_detect_status & ~jaguar2->cur_detect_status;
++	dev_info_ratelimited(&client->dev,
++		"plug_poll: novid=0x%02x last=0x%02x ret=0x%02x stream=%d",
++		jaguar2->cur_detect_status, jaguar2->last_detect_status,
++		returned, jaguar2->streaming);
+ 	jaguar2->last_detect_status = jaguar2->cur_detect_status;
+ 
+ 	if (jaguar2->hot_plug)
+-		dev_info(&client->dev, "%s has plug motion? (%s)", __func__,
+-				jaguar2->hot_plug ? "true" : "false");
+-	/*
+-	 * Allow one arbiter bounce after stream start to synchronize all
+-	 * VCs, then suppress subsequent bounces during active streaming
+-	 * to prevent MIPI TX disruption that freezes CIF channels.
+-	 * is_reset is cleared to 0 at stream start; we use it as a
+-	 * bounce counter.
+-	 */
+-	if (jaguar2->hot_plug && jaguar2->streaming && jaguar2->is_reset > 0) {
+-		dev_info(&client->dev, "skipping arbiter bounce (streaming, already synced)");
++		dev_info(&client->dev, "%s plug event: cur=0x%x returned=0x%x",
++			 __func__, jaguar2->cur_detect_status, returned);
++
++	if (returned && jaguar2->streaming) {
++		/*
++		 * Video returned on at least one channel. Let the analog
++		 * front-end stabilize, then re-run the full per-channel
++		 * init sequence (AFE, format, timing, EQ, arbiter).
++		 */
++		msleep(150);
++		for (ch = 0; ch < 4; ch++) {
++			if (!(returned & (1 << ch)))
++				continue;
++			dev_info(&client->dev,
++				 "hotplug reinit ch%d fmt=%d",
++				 ch, jaguar2->frame_size->fmt_idx);
++			jaguar2_reinit_channel(ch,
++					       jaguar2->frame_size->fmt_idx,
++					       SINGLE_ENDED);
++		}
++		jaguar2->is_reset = 1;
++		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
++				   &jaguar2->plug_state_check.d_work,
++				   msecs_to_jiffies(1500));
++	} else if (jaguar2->hot_plug && jaguar2->streaming
++		   && jaguar2->is_reset > 0) {
++		dev_info(&client->dev,
++			 "skipping arbiter bounce (streaming, already synced)");
++		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
++				   &jaguar2->plug_state_check.d_work,
++				   msecs_to_jiffies(100));
+ 	} else if (jaguar2->hot_plug) {
+ 		jaguar2->is_reset = 1;
+-		dev_dbg(&client->dev, "queue_delayed_work 1500ms, if has hot plug motion.");
+ 		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+-				   &jaguar2->plug_state_check.d_work, msecs_to_jiffies(1500));
++				   &jaguar2->plug_state_check.d_work,
++				   msecs_to_jiffies(1500));
+ 		jaguar2_write(client, 0xFF, 0x20);
+ 		jaguar2_write(client, 0x00, 0x00);
+-		//jaguar2_write(client, 0x00, (sync_status << 4) | sync_status);
+ 		usleep_range(3000, 5000);
+-		jaguar2_write(client, 0x00, 0xFF);
++		{
++			unsigned char active_en = 0;
++			int i;
++			for (i = 0; i < 4; i++) {
++				if (jaguar2_active & (1 << i))
++					active_en |= (0x11 << i);
++			}
++			if (!active_en)
++				active_en = 0xFF;
++			jaguar2_write(client, 0xFF, 0x20);
++			jaguar2_write(client, 0x00, active_en);
++			dev_info(&client->dev,
++				 "hot-plug arbiter: 0x%02X (active=0x%X)",
++				 active_en, jaguar2_active);
++		}
+ 	} else {
+-		dev_dbg(&client->dev, "queue_delayed_work 100ms, if no hot plug motion.");
+ 		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+-				   &jaguar2->plug_state_check.d_work, msecs_to_jiffies(100));
++				   &jaguar2->plug_state_check.d_work,
++				   msecs_to_jiffies(100));
+ 	}
+ }
+ #endif

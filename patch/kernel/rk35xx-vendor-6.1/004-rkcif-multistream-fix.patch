@@ -1,0 +1,43 @@
+From: Nick <nick@local>
+Subject: [PATCH] media: jaguar2: fix multi-stream VC capture
+
+The NVP6324 MIPI TX arbiter needs one reset bounce after initialization
+to properly synchronize all 4 virtual channels. Without this, VC1-VC3
+only deliver frames intermittently (~3fps instead of full rate).
+
+However, the plug_state_check_work repeatedly bounces the arbiter
+whenever it detects hot-plug status changes. During active multi-stream
+capture, these repeated bounces momentarily kill all MIPI TX output,
+causing the CIF to lose sync and freeze.
+
+Fix: allow exactly ONE arbiter bounce after stream start (using the
+is_reset field as a bounce counter), then suppress all subsequent
+bounces during streaming. This provides the needed post-init sync
+while preventing disruptive repeated bounces during capture.
+
+---
+ drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+@@ -704,7 +704,17 @@
+ 	if (jaguar2->hot_plug)
+ 		dev_info(&client->dev, "%s has plug motion? (%s)", __func__,
+ 				jaguar2->hot_plug ? "true" : "false");
+-	if (jaguar2->hot_plug) {
++	/*
++	 * Allow one arbiter bounce after stream start to synchronize all
++	 * VCs, then suppress subsequent bounces during active streaming
++	 * to prevent MIPI TX disruption that freezes CIF channels.
++	 * is_reset is cleared to 0 at stream start; we use it as a
++	 * bounce counter.
++	 */
++	if (jaguar2->hot_plug && jaguar2->streaming && jaguar2->is_reset > 0) {
++		dev_info(&client->dev, "skipping arbiter bounce (streaming, already synced)");
++	} else if (jaguar2->hot_plug) {
++		jaguar2->is_reset = 1;
+ 		dev_dbg(&client->dev, "queue_delayed_work 1500ms, if has hot plug motion.");
+ 		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+ 				   &jaguar2->plug_state_check.d_work, msecs_to_jiffies(1500));

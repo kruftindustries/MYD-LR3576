@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 MYIR Electronics Co., Ltd.
+ *
+ */
+
+/ {
+	vcc_camera2: vcc-camera2 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc_camera2";
+		regulator-boot-on;
+		regulator-always-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		enable-active-high;
+		gpio = <&gpio3 RK_PA2 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&camera2_pwr>;
+		vin-supply = <&vcc_sys>;
+	};
+
+	clk_camera2_fixed: clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "CLK_CAMERA2_24MHZ";
+	};
+};
+
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi_dphy0_in0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&n4_out>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy0_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi1_csi2_input>;
+			};
+		};
+	};
+};
+
+&csi2_dphy0_hw {
+	status = "okay";
+};
+
+&csi2_dphy1_hw {
+	status = "okay";
+};
+
+&i2c4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m3_xfer>;
+
+	jaguar2: jaguar2@31 {
+		status = "okay";
+		compatible = "jaguar1-v4l2";
+		reg = <0x31>;
+		clocks = <&clk_camera2_fixed>;
+		clock-names = "xvclk";
+		clock-frequency = <24000000>;
+		power-domains = <&power RK3576_PD_VI>;
+		pinctrl-names = "rockchip,camera_default",
+                        "rockchip,camera_sleep";
+		pinctrl-0 = <&camera2_default_pins>;
+		pinctrl-1 = <&camera2_sleep_pins>;
+		rst-gpios = <&gpio3 RK_PD4 GPIO_ACTIVE_HIGH>;
+		pwd-gpios = <&gpio3 RK_PD5 GPIO_ACTIVE_HIGH>;
+		rockchip,rst-gpio = <&gpio3 RK_PD4 GPIO_ACTIVE_HIGH>;
+		rockchip,pwd-gpio = <&gpio3 RK_PD5 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "default";
+		rockchip,camera-module-lens-name = "default";
+		rockchip,default_rect= <1920 1080>; // default resolution
+		port {
+			n4_out: endpoint {
+				remote-endpoint = <&mipi_dphy0_in0>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+&mipi1_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi1_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy0_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi1_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in1>;
+			};
+		};
+	};
+};
+
+&pinctrl {
+	camera2_pwr {
+		camera2_pwr: camera2-pwr {
+			rockchip,pins =
+				/* camera power en */
+				<3 RK_PA2 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+
+	camera2_default_pins {
+		camera2_default_pins: camera2-default-pins {
+			rockchip,pins =
+				<3 RK_PD4 RK_FUNC_GPIO &pcfg_pull_up>,
+				<3 RK_PD5 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	camera2_sleep_pins {
+		camera2_sleep_pins: camera2-sleep-pins {
+			rockchip,pins =
+				<3 RK_PD4 RK_FUNC_GPIO &pcfg_pull_up>,
+				<3 RK_PD5 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
+
+&rkcif {
+	status = "okay";
+	// rockchip,android-usb-camerahal-enable;
+};
+
+&rkcif_mipi_lvds1 {
+	status = "okay";
+
+	port {
+		cif_mipi_in1: endpoint {
+			remote-endpoint = <&mipi1_csi2_output>;
+		};
+	};
+};
+
+&rkcif_mmu {
+	status = "okay";
+};

@@ -1,0 +1,198 @@
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+@@ -172,6 +172,8 @@
+ 	struct v4l2_dv_timings timings;
+ 	bool md_enabled;
+ 	bool cross_format_done;		/* Initial cross-format probe completed */
++	u8 sysfs_bank;			/* Last bank for sysfs reg read */
++	u8 sysfs_reg;			/* Last register for sysfs reg read */
+ };
+ 
+ #define to_jaguar2(sd) container_of(sd, struct jaguar2, subdev)
+@@ -2178,6 +2180,164 @@
+ 	return 0;
+ }
+ 
++/* sysfs register read/write interface for live NVP6324 testing.
++ * Read:  echo "0x21 0x3e" > reg; cat reg
++ * Write: echo "0x21 0x3e 0x01" > reg
++ *
++ * Uses pm_runtime when device is idle (powers on chip temporarily).
++ * Skips pm_runtime when streaming (device already powered via s_power).
++ */
++static ssize_t reg_show(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++	bool need_pm = !jaguar2->power_on;
++	u8 val;
++	int ret;
++
++	if (need_pm) {
++		ret = pm_runtime_resume_and_get(dev);
++		if (ret < 0)
++			return ret;
++	}
++
++	down(&jaguar2_lock);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, jaguar2->sysfs_bank);
++	val = gpio_i2c_read(jaguar2_i2c_addr[0], jaguar2->sysfs_reg);
++	up(&jaguar2_lock);
++
++	if (need_pm) {
++		pm_runtime_mark_last_busy(dev);
++		pm_runtime_put_autosuspend(dev);
++	}
++
++	return sprintf(buf, "[0x%02X:0x%02X] = 0x%02X\n",
++		       jaguar2->sysfs_bank, jaguar2->sysfs_reg, val);
++}
++
++static ssize_t reg_store(struct device *dev,
++			 struct device_attribute *attr,
++			 const char *buf, size_t count)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++	unsigned int bank, reg, val;
++	int nargs, ret;
++
++	nargs = sscanf(buf, "%x %x %x", &bank, &reg, &val);
++	if (nargs < 2)
++		return -EINVAL;
++
++	jaguar2->sysfs_bank = bank;
++	jaguar2->sysfs_reg = reg;
++
++	if (nargs == 3) {
++		bool need_pm = !jaguar2->power_on;
++
++		if (need_pm) {
++			ret = pm_runtime_resume_and_get(dev);
++			if (ret < 0)
++				return ret;
++		}
++
++		down(&jaguar2_lock);
++		gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, bank);
++		gpio_i2c_write(jaguar2_i2c_addr[0], reg, val);
++		up(&jaguar2_lock);
++
++		if (need_pm) {
++			pm_runtime_mark_last_busy(dev);
++			pm_runtime_put_autosuspend(dev);
++		}
++
++		dev_info(dev, "NVP6324 write [0x%02X:0x%02X] = 0x%02X\n",
++			 bank, reg, (u8)val);
++	}
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(reg);
++
++/*
++ * Per-channel format configuration via sysfs.
++ * Read:  cat channel_fmt       → show all 4 channels
++ * Write: echo "0 6" > channel_fmt  → ch0 = DV timings index 6 (AHD 1080p25)
++ *        echo "2 0" > channel_fmt  → ch2 = DV timings index 0 (CVBS NTSC)
++ *
++ * DV timings indices (same as --set-dv-bt-timings index=N):
++ *   0=CVBS NTSC 720x480i60    1=CVBS PAL 720x576i50
++ *   2=AHD 720p25              3=AHD 720p30
++ *   4=AHD 720p50              5=AHD 720p60
++ *   6=AHD 1080p25             7=AHD 1080p30
++ *
++ * When streaming, reconfigures the decoder for the specified channel
++ * without disrupting other channels (uses probe_format, not reinit).
++ * Sets force_fmt=true so hotplug handler uses this format.
++ */
++static ssize_t channel_fmt_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++	int ch, len = 0;
++
++	for (ch = 0; ch < 4; ch++) {
++		u8 fmt = jaguar2->ch_state[ch].active_fmt;
++		const char *name = "unknown";
++		int i;
++
++		for (i = 0; i < ARRAY_SIZE(jaguar2_dv_timings); i++) {
++			if (jaguar2_dv_timings[i].fmt_idx == fmt) {
++				name = jaguar2_dv_timings[i].name;
++				break;
++			}
++		}
++		len += sprintf(buf + len, "ch%d: fmt=%d %s%s%s\n",
++			       ch, fmt, name,
++			       jaguar2->ch_state[ch].force_fmt ? " [forced]" : "",
++			       (jaguar2->streaming &&
++				!(jaguar2->cur_detect_status & (1 << ch)))
++				       ? " [signal]" : "");
++	}
++	return len;
++}
++
++static ssize_t channel_fmt_store(struct device *dev,
++				 struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++	unsigned int ch, dv_idx;
++	u8 fmt;
++
++	if (sscanf(buf, "%u %u", &ch, &dv_idx) != 2)
++		return -EINVAL;
++	if (ch > 3)
++		return -EINVAL;
++	if (dv_idx >= ARRAY_SIZE(jaguar2_dv_timings))
++		return -EINVAL;
++
++	fmt = jaguar2_dv_timings[dv_idx].fmt_idx;
++
++	mutex_lock(&jaguar2->mutex);
++	jaguar2->ch_state[ch].active_fmt = fmt;
++	jaguar2->ch_state[ch].force_fmt = true;
++	mutex_unlock(&jaguar2->mutex);
++
++	/* Apply to hardware immediately */
++	jaguar2_probe_format(ch, fmt, SINGLE_ENDED);
++
++	dev_info(dev, "ch%d: set %s (fmt=%d, dv_idx=%d)\n",
++		 ch, jaguar2_dv_timings[dv_idx].name, fmt, dv_idx);
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(channel_fmt);
++
+ static int jaguar2_probe(struct i2c_client *client,
+ 			 const struct i2c_device_id *id)
+ {
+@@ -2307,6 +2467,12 @@
+ 
+ #endif
+ 
++	/* Keep NVP6324 powered for 5s after sysfs reg access */
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_set_autosuspend_delay(dev, 5000);
++	device_create_file(dev, &dev_attr_reg);
++	device_create_file(dev, &dev_attr_channel_fmt);
++
+ 	return 0;
+ 
+ err_power_off:
+@@ -2322,6 +2488,8 @@
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct jaguar2 *jaguar2 = to_jaguar2(sd);
+ 
++	device_remove_file(&client->dev, &dev_attr_channel_fmt);
++	device_remove_file(&client->dev, &dev_attr_reg);
+ 	jaguar2_exit();
+ 	v4l2_ctrl_handler_free(&jaguar2->ctrl_handler);
+ 	mutex_destroy(&jaguar2->mutex);

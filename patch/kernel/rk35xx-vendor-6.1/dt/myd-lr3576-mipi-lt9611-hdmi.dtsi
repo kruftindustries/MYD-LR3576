@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 MYIR Electronics Co., Ltd.
+ *
+ */
+
+#include <dt-bindings/display/drm_mipi_dsi.h>
+#include <dt-bindings/display/rockchip_vop.h>
+
+/ {
+
+	lt9611_1v8: lt9611-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "lt9611_1v8";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		vin-supply = <&vcc_sys>;
+	};
+
+	lt9611_3v3: lt9611-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "lt9611_3v3";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		vin-supply = <&vcc_sys>;
+	};
+};
+
+&dsi {
+	status = "okay";
+	rockchip,lane-rate = <1200>;
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			dsi_out_lt9611: endpoint {
+				remote-endpoint = <&lt9611_in_dsi>;
+			};
+		};
+	};
+};
+
+&dsi_in_vp2 {
+	status = "okay";
+};
+
+&i2c4 {
+	status = "okay";
+	lt9611_bridge: bridge@39 {
+		status = "okay";
+		compatible = "lontium,lt9611";
+		reg = <0x39>;
+		interrupts-extended = <&gpio0 RK_PB4 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio0 RK_PA5 GPIO_ACTIVE_HIGH>;
+		enable-gpios = <&gpio2 RK_PD6 GPIO_ACTIVE_HIGH>;
+		vdd-supply = <&lt9611_1v8>;
+		vcc-supply = <&lt9611_3v3>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				lt9611_in_dsi: endpoint {
+					remote-endpoint = <&dsi_out_lt9611>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * mipidcphy0 needs to be enabled
+ * when dsi is enabled
+ */
+&mipidcphy0 {
+	status = "okay";
+};

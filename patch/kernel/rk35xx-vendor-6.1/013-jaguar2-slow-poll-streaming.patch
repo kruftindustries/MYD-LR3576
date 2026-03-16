@@ -1,0 +1,44 @@
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+@@ -1055,12 +1055,15 @@
+ 		usleep_range(20000, 21000);
+ 		/* get power on state first*/
+ 		jaguar2_no_signal(sd, &jaguar2->last_detect_status);
+-		/* check hot plug state */
+-		if (jaguar2->plug_state_check.state_check_wq) {
+-			dev_info(&client->dev, "%s queue_delayed_work 1000ms", __func__);
+-			queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+-					   &jaguar2->plug_state_check.d_work,
+-					   msecs_to_jiffies(1000));
+-		}
++		/*
++		 * Do NOT start the hotplug workqueue during streaming.
++		 * GPIO I2C polling disrupts NVP6324 MIPI TX output,
++		 * causing CSI_SIZE_ERR and visible frame glitches.
++		 * Channel formats are configured before streaming via
++		 * channel_fmt sysfs -- no runtime detection needed.
++		 */
++		dev_info(&client->dev,
++			 "%s: novid=0x%02x (hotplug poll disabled)",
++			 __func__, jaguar2->last_detect_status);
+ 		jaguar2->timestamp0 = ktime_get_ns();
+ #endif
+@@ -1604,9 +1607,15 @@
+ 				v4l2_subdev_notify_event(sd, &ev);
+ 			}
+ 		}
+-		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+-				   &jaguar2->plug_state_check.d_work,
+-				   msecs_to_jiffies(100));
++		/*
++		 * No hotplug: stop polling when streaming to avoid
++		 * MIPI TX disruption from GPIO I2C reads.
++		 */
++		if (!jaguar2->streaming)
++			queue_delayed_work(
++				jaguar2->plug_state_check.state_check_wq,
++				&jaguar2->plug_state_check.d_work,
++				msecs_to_jiffies(100));
+ 	}
+ }
+ #endif

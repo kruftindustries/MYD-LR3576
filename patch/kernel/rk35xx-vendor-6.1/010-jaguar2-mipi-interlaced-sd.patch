@@ -1,0 +1,174 @@
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.h
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.h
+@@ -25,6 +25,7 @@
+ typedef struct _mipi_vdfmt_set_s{
+ 	unsigned char arb_scale;
+ 	unsigned char mipi_frame_opt;
++	unsigned char rd_t_mode;
+ }mipi_vdfmt_set_s;
+
+ extern unsigned int jaguar2_mclk;
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_mipi_table.h
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_mipi_table.h
+@@ -20,7 +20,8 @@
+
+ /* -----------------------------------------------------------------------------
+  * arb_scale(20x01)                  : SD=2(1/4), HD=1(1/2), FHD=0(bypass)
+- * mipi_frame_opt(21x3E, 21x3F)      : SD only [TBD]
++ * mipi_frame_opt(21x3E, 21x3F)      : 0=prog, 4=NTSC_i, 5=PAL_i, 6=MAX_i
++ * rd_t_mode(20x20, 20x21)           : 0=auto, 1=1080, 2=720, 3=240, 4=288
+  *-----------------------------------------------------------------------------*/
+
+
+@@ -28,59 +29,73 @@
+ {
+ 	[ AHD20_SD_H960_2EX_Btype_NT ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H960_2EX_Btype_PAL ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_SH720_NT] = {
+ 		.arb_scale = 0x01,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_SH720_PAL] = {
+ 		.arb_scale = 0x01,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_H960_NT ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H960_PAL ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_H1280_NT ] = {
+ 		.arb_scale = 0x00,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H1280_PAL ] = {
+ 		.arb_scale = 0x00,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_H1440_NT ] = {
+ 		.arb_scale = 0x00,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H1440_PAL ] = {
+ 		.arb_scale = 0x00,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_H960_EX_NT ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H960_EX_PAL ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_SD_H960_2EX_NT ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x04,
++		.rd_t_mode = 0x03,
+ 	},
+ 	[ AHD20_SD_H960_2EX_PAL ] = {
+ 		.arb_scale = 0x02,
+-		.mipi_frame_opt = 0x00,
++		.mipi_frame_opt = 0x05,
++		.rd_t_mode = 0x04,
+ 	},
+ 	[ AHD20_1080P_30P ] = {
+ 		.arb_scale = 0x00,
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_mipi.c
+@@ -42,6 +42,41 @@
+ 	gpio_i2c_write(jaguar2_i2c_addr[devnum], 0x01, arb_scale);
+ }
+
++static void arb_rd_t_mode_set(video_input_init *dev_ch_info, unsigned char val)
++{
++	int devnum = dev_ch_info->ch / 4;
++	int ch_local = dev_ch_info->ch % 4;
++	unsigned char reg, rd_t;
++
++	gpio_i2c_write(jaguar2_i2c_addr[devnum], 0xFF, 0x20);
++
++	/* CH1/CH2 in reg 0x20, CH3/CH4 in reg 0x21 (4 bits each) */
++	reg = (ch_local < 2) ? 0x20 : 0x21;
++	rd_t = gpio_i2c_read(jaguar2_i2c_addr[devnum], reg);
++
++	if (ch_local & 1) {
++		/* CH2/CH4: bits [7:4] */
++		rd_t = (rd_t & 0x0F) | (val << 4);
++	} else {
++		/* CH1/CH3: bits [3:0] */
++		rd_t = (rd_t & 0xF0) | (val & 0x0F);
++	}
++
++	gpio_i2c_write(jaguar2_i2c_addr[devnum], reg, rd_t);
++}
++
++static void arb_no_opt_set(int dev_num)
++{
++	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0xFF, 0x20);
++
++	/*
++	 * ARB_NO_OPT bits [3:0]: suppress MIPI TX for no-video channels.
++	 * HCNT_ERR bits [7:4]: enable H size error detection.
++	 * Set all channels: 0xFF = all HCNT_ERR + all ARB_NO_OPT enabled.
++	 */
++	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x3A, 0xFF);
++}
++
+ void arb_enable2(int dev_num)
+ {
+ 	unsigned char active_en = 0;
+@@ -92,6 +127,9 @@
+ 	// ARB RESET Low
+ 	gpio_i2c_write(jaguar2_i2c_addr[dev_num], 0x40, 0x00);
+
++	/* Suppress MIPI TX on no-video channels */
++	arb_no_opt_set(dev_num);
++
+ 	arb_enable2(dev_num);
+ }
+
+@@ -145,6 +183,9 @@
+
+ 	mipi_frame_opt_set(dev_ch_info, mipi_vd_fmt.mipi_frame_opt);
+ 	arb_scale_set(dev_ch_info, mipi_vd_fmt.arb_scale);
++
++	/* Set arbiter read line count for this channel's format */
++	arb_rd_t_mode_set(dev_ch_info, mipi_vd_fmt.rd_t_mode);
+ }
+
+ int mipi_datatype_set2(unsigned char data_type)

@@ -1,0 +1,18 @@
+# Add these to the END of config/sources/families/rk35xx.conf
+# ---
+# After the OVERLAY_PREFIX= line, add the RK3576 boot script selection:
+
+if [[ "$BOOT_SOC" == "rk3576" ]]; then
+	BOOTSCRIPT='boot-rk3576.cmd:boot.cmd'
+fi
+
+# Append this function to the end of the file:
+
+# Disable CSF support for RK3576 Mali G52 Bifrost GPU
+# CSF (Command Stream Frontend) is only for Valhall GPUs (RK3588), not Bifrost (RK3576)
+function custom_kernel_config__rk3576_mali_no_csf() {
+	if [[ "$BOOT_SOC" == "rk3576" ]]; then
+		display_alert "Disabling Mali CSF support" "RK3576 uses Bifrost GPU, not Valhall" "info"
+		opts_n+=("MALI_CSF_SUPPORT")
+	fi
+}

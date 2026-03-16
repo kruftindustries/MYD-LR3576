@@ -1,0 +1,53 @@
+From: Nick <nick@local>
+Subject: [PATCH] media: rkcif: don't drop frames or reset CTRL on CSI size errors
+
+When a MIPI CSI-2 source sends multiple Virtual Channels but only some
+CIF IDs are actively capturing, the unused VCs trigger CSI_SIZE_ERR
+interrupts. The current IRQ handler does two things that kill multi-VC
+throughput:
+
+1. It bounces the MIPI LVDS CTRL register (0x000A0000) on every size
+   error, which resets the receiver and forces re-sync, losing frames.
+
+2. It returns early after the reset, dropping frame-end events for
+   active capture IDs that arrived in the same interrupt.
+
+This severely impacts multi-VC sensors like the NVP6324 where 4 channels
+are multiplexed over one MIPI link. With only one channel captured, the
+other 3 VCs continuously trigger size errors, reducing the active
+channel's capture rate from 25fps to ~5fps.
+
+Fix: skip the CTRL reset (which was the main throughput killer) and
+clear the CSI_SIZE_ERR bits from the local intstat instead of returning.
+This allows frame-end events for active IDs to be properly handled even
+when size errors occur simultaneously from unused IDs.
+
+---
+ drivers/media/platform/rockchip/cif/capture.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -14229,10 +14229,17 @@
+ 				cif_dev->csi_host_idx = tmp_csi_host_idx;
+ 			} else {
+-				rkcif_write_register_or(cif_dev, CIF_REG_MIPI_LVDS_CTRL, 0x000A0000);
+-				if (cif_dev->chip_id >= CHIP_RV1103B_CIF)
+-					rkcif_write_register_and(cif_dev, CIF_REG_MIPI_LVDS_CTRL, ~0x000f0000);
++				/*
++				 * Skip the CTRL reset (0x000A0000) for multi-VC.
++				 * Bouncing the MIPI receiver on size errors from
++				 * unused virtual channels forces re-sync and kills
++				 * throughput on active capture IDs.
++				 */
+ 			}
+-			return;
++			/*
++			 * Don't return - clear size error bits and continue
++			 * processing frame-end events for active capture IDs.
++			 */
++			intstat &= ~CSI_SIZE_ERR;
+ 		}
+ 
+ 		if (intstat & CSI_FIFO_OVERFLOW_V1) {

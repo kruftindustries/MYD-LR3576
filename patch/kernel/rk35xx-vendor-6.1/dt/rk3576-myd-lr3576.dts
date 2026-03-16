@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ */
+
+/dts-v1/;
+
+#include "rk3576.dtsi"
+#include "rk3576-myd-lr3576.dtsi"
+#include "myd-lr3576-camera-n4-x3.dtsi"
+/*
+#include "myd-lr3576-camera1-ov13855.dtsi"
+#include "myd-lr3576-camera2-n4.dtsi"
+#include "myd-lr3576-camera3-ov5640.dtsi"
+*/
+
+/ {
+	model = "MYIR Board MYD-LR3576";
+	compatible = "rockchip,rk3576-evb1-v10", "rockchip,rk3576";
+};

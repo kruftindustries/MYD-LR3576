@@ -1,0 +1,1416 @@
+diff -ruN a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c	2026-02-17 20:37:14.767488491 -0600
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.c	2026-02-21 00:14:23.176021663 -0600
+@@ -773,6 +773,116 @@
+ 	up(&jaguar2_lock);
+ }
+ 
++/*
++ * Lightweight format probe: configure decoder for a format without
++ * touching MIPI output or arbiter. Used by query_dv_timings to test
++ * each format for sync lock without destabilizing the chip.
++ * Caller must NOT hold jaguar2_lock.
++ */
++void jaguar2_probe_format(int ch, unsigned char fmt, int input)
++{
++	video_input_init video_val;
++
++	video_val.ch = ch;
++	video_val.format = fmt;
++	video_val.input = input;
++	video_val.interface = YUV_422;
++
++	down(&jaguar2_lock);
++
++	vd_jaguar2_init_set(&video_val);
++
++	/* Restore NOVID detection for this channel */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x18 + ch, 0x13);
++
++	up(&jaguar2_lock);
++}
++
++/*
++ * Re-enable VFC (Video Format Check) auto-detection on a channel.
++ * The init sequence (vd_vi_manual_set_seq1) disables VFC by clearing
++ * Bank 0x13 regs 0x30-0x32 and Bank 0x01 reg 0x7C clock auto bits.
++ * This reverses that to allow the hardware to detect the input format.
++ * Caller must hold jaguar2_lock.
++ */
++void jaguar2_vfc_enable(int ch)
++{
++	unsigned char val;
++
++	/*
++	 * Reset format registers to neutral/auto so VFC can detect
++	 * any input type (AHD or CVBS). The manual init sets these
++	 * for a specific format which prevents VFC from detecting
++	 * a different input type (e.g., CVBS when configured for AHD).
++	 */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x08 + ch, 0x00); /* AHD_MODE = auto */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x04 + ch, 0x00); /* SD_MODE = auto */
++
++	/* Clock auto-select: Bank 0x01 reg 0x7C */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x01);
++	val = gpio_i2c_read(jaguar2_i2c_addr[0], 0x7C);
++	val |= (1 << ch);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x7C, val);
++
++	/* Bank 0x13 regs 0x30-0x32: enable VFC detection */
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x13);
++
++	val = gpio_i2c_read(jaguar2_i2c_addr[0], 0x30);
++	val |= (1 << ch) | (1 << (ch + 4));
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x30, val);
++
++	val = gpio_i2c_read(jaguar2_i2c_addr[0], 0x31);
++	val |= (1 << ch) | (1 << (ch + 4));
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x31, val);
++
++	val = gpio_i2c_read(jaguar2_i2c_addr[0], 0x32);
++	val |= (1 << ch);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0x32, val);
++}
++
++/*
++ * Read VFC detected format from Bank 0x05+ch, reg 0xF0.
++ * Returns raw byte: 0xFF = no video, other = detected format code.
++ * Pattern from jaguar2_coax_protocol.c:1273-1274.
++ * Caller must hold jaguar2_lock.
++ */
++u8 jaguar2_vfc_read(int ch)
++{
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x05 + ch);
++	return gpio_i2c_read(jaguar2_i2c_addr[0], 0xF0);
++}
++
++/*
++ * Map VFC auto-detect register value to NC_VIVO_CH_FORMATDEF.
++ * Values correspond to ahd_mode field in jaguar2_video_table.h.
++ * SD/CVBS uses separate VFC codes (0x21=PAL, 0x22=NTSC).
++ */
++u8 jaguar2_vfc_to_formatdef(u8 vfc_val)
++{
++	switch (vfc_val) {
++	case 0x02: return AHD20_1080P_30P;
++	case 0x03: return AHD20_1080P_25P;
++	case 0x04: return AHD20_720P_60P;
++	case 0x05: return AHD20_720P_50P;
++	case 0x06: return AHD20_720P_30P;
++	case 0x0A: return AHD20_720P_30P_EX;
++	case 0x0B: return AHD20_720P_25P_EX;
++	case 0x0C: return AHD20_720P_30P_EX_Btype;
++	case 0x0D: return AHD20_720P_25P_EX_Btype;
++	case 0x21: return AHD20_SD_H960_2EX_Btype_PAL;
++	case 0x22: return AHD20_SD_H960_2EX_Btype_NT;
++	case 0xFA: return AHD20_SD_H960_2EX_Btype_PAL;
++	case 0xFB: return AHD20_SD_H960_2EX_Btype_NT;
++	case 0xFF: return NC_VIVO_CH_FORMATDEF_UNKNOWN;
++	default:
++		printk(KERN_WARNING "VFC: unknown format code 0x%02x\n",
++		       vfc_val);
++		return NC_VIVO_CH_FORMATDEF_UNKNOWN;
++	}
++}
++
+ /*******************************************************************************
+  *	Description		: i2c client initial
+  *	Argurments		: void
+@@ -954,8 +1064,10 @@
+ 	printk("JAGUAR1 DEVICE DRIVER UNLOAD SUCCESS\n");
+ }
+ 
++#ifndef MODULE
+ module_init(jaguar2_module_init);
+ module_exit(jaguar2_module_exit);
++#endif
+ 
+ MODULE_LICENSE("GPL");
+ 
+diff -ruN a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h	2026-02-17 20:36:43.612994984 -0600
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_drv.h	2026-02-17 22:28:45.681075648 -0600
+@@ -26,6 +26,12 @@
+ void jaguar2_start(video_init_all *video_init);
+ void jaguar2_stop(void);
+ void jaguar2_reinit_channel(int ch, unsigned char fmt, int input);
++void jaguar2_probe_format(int ch, unsigned char fmt, int input);
++void jaguar2_vfc_enable(int ch);
++u8 jaguar2_vfc_read(int ch);
++u8 jaguar2_vfc_to_formatdef(u8 vfc_val);
++
++extern struct semaphore jaguar2_lock;
+ int jaguar2_init(int i2c_bus);
+ void jaguar2_exit(void);
+ 
+diff -ruN a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c
+--- a/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c	2026-02-17 20:36:26.641713183 -0600
++++ b/drivers/media/i2c/jaguar2_drv/jaguar2_v4l2.c	2026-02-21 18:33:10.978452419 -0600
+@@ -21,6 +21,9 @@
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-subdev.h>
+ #include <media/v4l2-fwnode.h>
++#include <media/v4l2-event.h>
++#include <media/v4l2-dv-timings.h>
++#include <linux/v4l2-dv-timings.h>
+ #include <linux/pinctrl/consumer.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -160,6 +163,16 @@
+ 	bool hot_plug;
+ 	u8 is_reset;
+ 	struct semaphore reg_sem;
++	struct {
++		u8 detected_fmt;	/* NC_VIVO_CH_FORMATDEF from VFC */
++		u8 active_fmt;		/* Currently applied format */
++		bool force_fmt;		/* Manual override active */
++		u8 vfc_raw;		/* Last VFC register value */
++	} ch_state[4];
++	struct v4l2_dv_timings timings;
++	bool md_enabled;
++	int novid_persist;		/* Polls with all channels no-video */
++	bool cross_format_done;		/* Initial cross-format probe completed */
+ };
+ 
+ #define to_jaguar2(sd) container_of(sd, struct jaguar2, subdev)
+@@ -177,21 +190,21 @@
+ 	}
+ #else
+ 	{
+-		.width		= 960,
++		.width		= 720,
+ 		.height		= 480,
+ 		.max_fps = {
+ 			.numerator = 10000,
+-			.denominator = 250000,
++			.denominator = 300000,
+ 		},
+ 		.fmt_idx	= AHD20_SD_H960_2EX_Btype_NT,
+ 		.field = V4L2_FIELD_INTERLACED,
+ 	},
+ 	{
+-		.width		= 960,
++		.width		= 720,
+ 		.height		= 576,
+ 		.max_fps = {
+ 			.numerator = 10000,
+-			.denominator = 300000,
++			.denominator = 250000,
+ 		},
+ 		.fmt_idx	= AHD20_SD_H960_2EX_Btype_PAL,
+ 		.field = V4L2_FIELD_INTERLACED,
+@@ -239,6 +252,132 @@
+ 	JAGUAR1_LINK_FREQ
+ };
+ 
++/* Custom V4L2 control for NVP6324 pixel sensitivity (PSEN) */
++#define V4L2_CID_JAGUAR2_PSEN (V4L2_CID_USER_BASE + 0x1000)
++
++/*
++ * DV timings table for NVP6324 supported input formats.
++ * Each entry maps to an NC_VIVO_CH_FORMATDEF for the hardware register table.
++ * Pixelclock and blanking follow standard BT.656/BT.1120 conventions.
++ */
++struct jaguar2_dv_timings_entry {
++	struct v4l2_dv_timings timings;
++	u8 fmt_idx;
++	const char *name;
++};
++
++static const struct jaguar2_dv_timings_entry jaguar2_dv_timings[] = {
++	/* 0: CVBS NTSC 720x480i60 */
++	{
++		.timings = V4L2_DV_BT_CEA_720X480I59_94,
++		.fmt_idx = AHD20_SD_H960_2EX_Btype_NT,
++		.name = "CVBS NTSC 720x480i60",
++	},
++	/* 1: CVBS PAL 720x576i50 */
++	{
++		.timings = V4L2_DV_BT_CEA_720X576I50,
++		.fmt_idx = AHD20_SD_H960_2EX_Btype_PAL,
++		.name = "CVBS PAL 720x576i50",
++	},
++	/* 2: AHD 1280x720p25 */
++	{
++		.timings = {
++			.type = V4L2_DV_BT_656_1120,
++			.bt = {
++				.width = 1280,
++				.height = 720,
++				.interlaced = V4L2_DV_PROGRESSIVE,
++				.pixelclock = 74250000,
++				.hfrontporch = 2680,
++				.hsync = 0,
++				.hbackporch = 0,
++				.vfrontporch = 25,
++				.vsync = 5,
++				.vbackporch = 0,
++				.standards = V4L2_DV_BT_STD_CEA861,
++			},
++		},
++		.fmt_idx = AHD20_720P_25P_EX_Btype,
++		.name = "AHD 1280x720p25",
++	},
++	/* 3: AHD 1280x720p30 */
++	{
++		.timings = {
++			.type = V4L2_DV_BT_656_1120,
++			.bt = {
++				.width = 1280,
++				.height = 720,
++				.interlaced = V4L2_DV_PROGRESSIVE,
++				.pixelclock = 74250000,
++				.hfrontporch = 2020,
++				.hsync = 0,
++				.hbackporch = 0,
++				.vfrontporch = 25,
++				.vsync = 5,
++				.vbackporch = 0,
++				.standards = V4L2_DV_BT_STD_CEA861,
++			},
++		},
++		.fmt_idx = AHD20_720P_30P_EX_Btype,
++		.name = "AHD 1280x720p30",
++	},
++	/* 4: AHD 1280x720p50 */
++	{
++		.timings = V4L2_DV_BT_CEA_1280X720P50,
++		.fmt_idx = AHD20_720P_50P,
++		.name = "AHD 1280x720p50",
++	},
++	/* 5: AHD 1280x720p60 */
++	{
++		.timings = V4L2_DV_BT_CEA_1280X720P60,
++		.fmt_idx = AHD20_720P_60P,
++		.name = "AHD 1280x720p60",
++	},
++	/* 6: AHD 1920x1080p25 */
++	{
++		.timings = V4L2_DV_BT_CEA_1920X1080P25,
++		.fmt_idx = AHD20_1080P_25P,
++		.name = "AHD 1920x1080p25",
++	},
++	/* 7: AHD 1920x1080p30 */
++	{
++		.timings = V4L2_DV_BT_CEA_1920X1080P30,
++		.fmt_idx = AHD20_1080P_30P,
++		.name = "AHD 1920x1080p30",
++	},
++};
++
++static const struct v4l2_dv_timings_cap jaguar2_timings_cap = {
++	.type = V4L2_DV_BT_656_1120,
++	.bt = {
++		.min_width = 720,
++		.max_width = 1920,
++		.min_height = 480,
++		.max_height = 1080,
++		.min_pixelclock = 13500000,
++		.max_pixelclock = 148500000,
++		.standards = V4L2_DV_BT_STD_CEA861,
++		.capabilities = V4L2_DV_BT_CAP_PROGRESSIVE |
++				V4L2_DV_BT_CAP_INTERLACED,
++	},
++};
++
++/*
++ * Format probe order: try most common formats first.
++ * For each format, reinit the channel and check for sync lock.
++ * Used by jaguar2_auto_detect_format() and hotplug handler.
++ */
++static const int jaguar2_probe_order[] = {
++	6, /* AHD 1080p25 - most common AHD */
++	7, /* AHD 1080p30 */
++	2, /* AHD 720p25 */
++	3, /* AHD 720p30 */
++	0, /* CVBS NTSC 480i - try before PAL (can't distinguish by sync) */
++	1, /* CVBS PAL 576i */
++	4, /* AHD 720p50 */
++	5, /* AHD 720p60 */
++};
++
+ /* sensor register write */
+ static int jaguar2_write(struct i2c_client *client, u8 reg, u8 val)
+ {
+@@ -447,6 +586,11 @@
+ 	return ret;
+ }
+ 
++static int jaguar2_s_ctrl(struct v4l2_ctrl *ctrl);
++static const struct v4l2_ctrl_ops jaguar2_ctrl_ops = {
++	.s_ctrl = jaguar2_s_ctrl,
++};
++
+ static int jaguar2_initialize_controls(struct jaguar2 *jaguar2)
+ {
+ 	struct v4l2_ctrl_handler *handler;
+@@ -454,7 +598,7 @@
+ 	int ret;
+ 
+ 	handler = &jaguar2->ctrl_handler;
+-	ret = v4l2_ctrl_handler_init(handler, 2);
++	ret = v4l2_ctrl_handler_init(handler, 6);
+ 	if (ret)
+ 		return ret;
+ 	handler->lock = &jaguar2->mutex;
+@@ -467,6 +611,31 @@
+ 	v4l2_ctrl_new_std(handler, NULL, V4L2_CID_PIXEL_RATE,
+ 			  0, JAGUAR1_PIXEL_RATE, 1, JAGUAR1_PIXEL_RATE);
+ 
++	/* Motion detection controls */
++	v4l2_ctrl_new_std_menu(handler, &jaguar2_ctrl_ops,
++			       V4L2_CID_DETECT_MD_MODE,
++			       V4L2_DETECT_MD_MODE_REGION_GRID,
++			       0, V4L2_DETECT_MD_MODE_DISABLED);
++
++	v4l2_ctrl_new_std(handler, &jaguar2_ctrl_ops,
++			  V4L2_CID_DETECT_MD_GLOBAL_THRESHOLD,
++			  0, 255, 1, 128);
++
++	/* Custom pixel sensitivity (PSEN) control */
++	{
++		static const struct v4l2_ctrl_config psen_cfg = {
++			.ops = &jaguar2_ctrl_ops,
++			.id = V4L2_CID_JAGUAR2_PSEN,
++			.name = "Pixel Sensitivity (PSEN)",
++			.type = V4L2_CTRL_TYPE_INTEGER,
++			.min = 0,
++			.max = 7,
++			.step = 1,
++			.def = 3,
++		};
++		v4l2_ctrl_new_custom(handler, &psen_cfg, NULL);
++	}
++
+ 	if (handler->error) {
+ 		ret = handler->error;
+ 		dev_err(&jaguar2->client->dev,
+@@ -514,6 +683,324 @@
+ }
+ 
+ static inline bool jaguar2_no_signal(struct v4l2_subdev *sd, u8 *novid);
++
++/*
++ * Auto-detect camera format per-channel via register probing.
++ * For each channel 0-3, tries the previous format first, then probes
++ * all supported formats checking for sync lock.  Updates ch_state[]
++ * individually.  Sets global frame_size/format/timings from the first
++ * channel with signal (for mbus negotiation with rkcif).
++ * Called with jaguar2->mutex held.
++ * Returns true if at least one channel detected a format.
++ */
++static bool jaguar2_auto_detect_format(struct jaguar2 *jaguar2)
++{
++	struct i2c_client *client = jaguar2->client;
++	int ch, pi, j;
++	bool any_detected = false;
++	bool any_probed = false;
++	int primary_dv_idx = -1;
++
++	/* Ensure chip is powered on (runtime PM may have suspended it) */
++	if (!jaguar2->power_on) {
++		if (__jaguar2_power_on(jaguar2) < 0)
++			return false;
++		usleep_range(40000, 50000);
++		jaguar2->power_on = true;
++	}
++
++	/*
++	 * Enable NOVID detection for all channels (boot-time
++	 * vd_vi_manual_set_seq1() disables it).
++	 *
++	 * Do NOT disable the MIPI TX arbiter here: s_stream is
++	 * called after the CIF DMA engine is already running.
++	 * Disabling the arbiter would starve the CIF of MIPI data,
++	 * causing hundreds of thousands of zero-size CSI_SIZE_ERR
++	 * interrupts that leave the IOMMU with pending page faults
++	 * and crash rk_iommu_disable() on stream stop.
++	 *
++	 * jaguar2_probe_format() only configures decoder registers
++	 * (AFE/timing/EQ) without touching MIPI output, so the
++	 * arbiter can stay active during probing.  Brief format-
++	 * transition glitches produce occasional CSI_SIZE_ERR
++	 * which patch 005 handles gracefully.
++	 */
++	down(&jaguar2_lock);
++	gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++	for (ch = 0; ch < 4; ch++)
++		gpio_i2c_write(jaguar2_i2c_addr[0], 0x18 + ch, 0x13);
++	up(&jaguar2_lock);
++
++	/* NOVID detection needs time to settle after being enabled */
++	msleep(50);
++
++	for (ch = 0; ch < 4; ch++) {
++		u8 prev_fmt = jaguar2->ch_state[ch].active_fmt;
++		u8 nosig, sync_v, hperiod;
++		bool found = false;
++		bool probed = false;
++		int found_dv_idx = -1;
++
++		/*
++		 * Fast path: check if current config already matches
++		 * the connected signal.  Just read status registers
++		 * without reconfiguring the decoder (~0ms).
++		 */
++		down(&jaguar2_lock);
++		gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++		nosig = gpio_i2c_read(jaguar2_i2c_addr[0], 0xA0);
++		sync_v = gpio_i2c_read(jaguar2_i2c_addr[0],
++				       0xD0 + ch);
++		hperiod = gpio_i2c_read(jaguar2_i2c_addr[0],
++					0xD8 + ch);
++		up(&jaguar2_lock);
++
++		if (nosig != 0xFA && sync_v != 0xFA &&
++		    !(nosig & (1 << ch)) && sync_v && hperiod) {
++			/* Current format matches — find DV timings entry */
++			for (j = 0; j < ARRAY_SIZE(jaguar2_dv_timings); j++) {
++				if (jaguar2_dv_timings[j].fmt_idx == prev_fmt) {
++					found_dv_idx = j;
++					break;
++				}
++			}
++			found = true;
++			dev_info(&client->dev,
++				 "auto-detect ch%d: current fmt=%d OK",
++				 ch, prev_fmt);
++			goto ch_done;
++		}
++
++		/*
++		 * Quick no-signal check: if nosig bit is set AND at
++		 * least one other channel has signal, this channel
++		 * likely has no camera.  Skip the expensive probe.
++		 *
++		 * But if ALL channels show no-signal (0x0F), the
++		 * current decoder format class may be wrong (e.g.
++		 * AHD mode can't detect CVBS cameras via NOVID).
++		 * Fall through to full probe in that case.
++		 */
++		if ((nosig & (1 << ch)) && (nosig & 0x0F) != 0x0F) {
++			dev_info(&client->dev,
++				 "auto-detect ch%d: no signal (nosig=0x%02x)",
++				 ch, nosig);
++			goto ch_done;
++		}
++		{
++			/*
++			 * When all channels show no-signal, the current
++			 * format class is likely wrong (e.g. AHD mode
++			 * cannot detect CVBS).  Must try ALL formats —
++			 * nosig_streak early-exit would miss cross-class.
++			 */
++			bool all_nosig = (nosig & 0x0F) == 0x0F;
++
++			if (all_nosig)
++				dev_info(&client->dev,
++					 "auto-detect ch%d: all-nosig, probing formats",
++					 ch);
++		}
++
++		/*
++		 * Signal present but format mismatch.  Probe formats in
++		 * priority order with 200ms settle time (CVBS needs
++		 * ~150ms for sync separator stabilization).
++		 * Skip the current format (already checked).
++		 * After 2 consecutive no-signal results, assume empty
++		 * channel and stop probing (disabled for all-nosig
++		 * cross-format mode).
++		 */
++		probed = true;
++		any_probed = true;
++		{
++			bool all_nosig = (nosig & 0x0F) == 0x0F;
++			int nosig_streak = 0;
++
++			for (pi = 0; pi < ARRAY_SIZE(jaguar2_probe_order); pi++) {
++				int idx = jaguar2_probe_order[pi];
++				u8 fmt = jaguar2_dv_timings[idx].fmt_idx;
++
++				if (fmt == prev_fmt)
++					continue;
++
++				jaguar2_probe_format(ch, fmt, SINGLE_ENDED);
++				msleep(200);
++
++				down(&jaguar2_lock);
++				gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF,
++					       0x00);
++				nosig = gpio_i2c_read(jaguar2_i2c_addr[0],
++						      0xA0);
++				sync_v = gpio_i2c_read(jaguar2_i2c_addr[0],
++						       0xD0 + ch);
++				hperiod = gpio_i2c_read(jaguar2_i2c_addr[0],
++							0xD8 + ch);
++				up(&jaguar2_lock);
++
++				if (nosig == 0xFA || sync_v == 0xFA)
++					continue;
++
++				if (!(nosig & (1 << ch)) && sync_v &&
++				    hperiod) {
++					found = true;
++					found_dv_idx = idx;
++					dev_info(&client->dev,
++						 "auto-detect ch%d: probe %s (fmt=%d)",
++						 ch,
++						 jaguar2_dv_timings[idx].name,
++						 fmt);
++					break;
++				}
++
++				/*
++				 * In all-nosig mode, skip the early exit:
++				 * we must try every format class since
++				 * nosig is unreliable across classes.
++				 */
++				if (!all_nosig) {
++					if (nosig & (1 << ch))
++						nosig_streak++;
++					else
++						nosig_streak = 0;
++					if (nosig_streak >= 2)
++						break;
++				}
++			}
++		}
++
++ch_done:
++		if (found && found_dv_idx >= 0) {
++			u8 fmt = jaguar2_dv_timings[found_dv_idx].fmt_idx;
++
++			jaguar2->ch_state[ch].detected_fmt = fmt;
++			jaguar2->ch_state[ch].active_fmt = fmt;
++			jaguar2->ch_state[ch].vfc_raw = 0;
++			any_detected = true;
++
++			if (primary_dv_idx < 0)
++				primary_dv_idx = found_dv_idx;
++		} else {
++			/*
++			 * No format matched.  Restore decoder to current
++			 * active_fmt so color bars render correctly.
++			 * Skip if we never probed (quick nosig skip).
++			 */
++			if (probed && prev_fmt != NC_VIVO_CH_FORMATDEF_UNKNOWN)
++				jaguar2_probe_format(ch, prev_fmt,
++						     SINGLE_ENDED);
++			jaguar2->ch_state[ch].detected_fmt =
++				NC_VIVO_CH_FORMATDEF_UNKNOWN;
++			dev_info(&client->dev,
++				 "auto-detect ch%d: no signal", ch);
++		}
++	}
++
++	if (primary_dv_idx >= 0) {
++		u8 fmt = jaguar2_dv_timings[primary_dv_idx].fmt_idx;
++		u16 det_w = jaguar2_dv_timings[primary_dv_idx].timings.bt.width;
++		u16 det_h = jaguar2_dv_timings[primary_dv_idx].timings.bt.height;
++		u16 cur_w = jaguar2->frame_size->width;
++		u16 cur_h = jaguar2->frame_size->height;
++
++		if (det_w == cur_w && det_h == cur_h) {
++			/*
++			 * Same resolution — safe to use detected format.
++			 * Update frame_size, mbus format, and DV timings.
++			 */
++			for (j = 0; j < ARRAY_SIZE(jaguar2_framesizes); j++) {
++				if (jaguar2_framesizes[j].fmt_idx == fmt) {
++					jaguar2->frame_size =
++						&jaguar2_framesizes[j];
++					break;
++				}
++			}
++			jaguar2->format.width = jaguar2->frame_size->width;
++			jaguar2->format.height = jaguar2->frame_size->height;
++			jaguar2->format.field = jaguar2->frame_size->field;
++			jaguar2->timings =
++				jaguar2_dv_timings[primary_dv_idx].timings;
++
++			dev_info(&client->dev,
++				 "auto-detect: primary=%s, ch[%d/%d/%d/%d]",
++				 jaguar2_dv_timings[primary_dv_idx].name,
++				 jaguar2->ch_state[0].active_fmt,
++				 jaguar2->ch_state[1].active_fmt,
++				 jaguar2->ch_state[2].active_fmt,
++				 jaguar2->ch_state[3].active_fmt);
++		} else {
++			/*
++			 * Different resolution detected (e.g. CVBS 720x480
++			 * when pipeline is set for 1920x1080).  Cannot
++			 * change pipeline format at s_stream time — the
++			 * CIF/IOMMU buffers are already allocated for the
++			 * negotiated size.  Restore decoder to current
++			 * format (color bars) and fire SOURCE_CHANGE so
++			 * userspace restarts with the correct resolution.
++			 */
++			dev_info(&client->dev,
++				 "auto-detect: %s (%ux%u) != pipeline (%ux%u), need restart",
++				 jaguar2_dv_timings[primary_dv_idx].name,
++				 det_w, det_h, cur_w, cur_h);
++
++			/* Restore decoder to pipeline format */
++			for (ch = 0; ch < 4; ch++)
++				jaguar2_probe_format(ch,
++					jaguar2->frame_size->fmt_idx,
++					SINGLE_ENDED);
++
++			/* Store detection for query_dv_timings */
++			jaguar2->timings =
++				jaguar2_dv_timings[primary_dv_idx].timings;
++
++			{
++				static const struct v4l2_event ev = {
++					.type = V4L2_EVENT_SOURCE_CHANGE,
++					.u.src_change.changes =
++						V4L2_EVENT_SRC_CH_RESOLUTION,
++				};
++				v4l2_subdev_notify_event(
++					&jaguar2->subdev, &ev);
++			}
++			any_detected = false;
++		}
++	} else {
++		/*
++		 * No signal on any channel.  Restore decoder to the
++		 * default format so color bars are output at the
++		 * resolution the pipeline expects.
++		 */
++		u8 def_fmt = jaguar2->frame_size->fmt_idx;
++
++		/*
++		 * Only restore if decoder was reconfigured during
++		 * probing.  At boot, all channels are already set to
++		 * the default format by vd_jaguar2_init_set().
++		 */
++		if (any_probed)
++			for (ch = 0; ch < 4; ch++)
++				jaguar2_probe_format(ch, def_fmt,
++						     SINGLE_ENDED);
++
++		/* Set DV timings to match default format */
++		for (j = 0; j < ARRAY_SIZE(jaguar2_dv_timings); j++) {
++			if (jaguar2_dv_timings[j].fmt_idx == def_fmt) {
++				jaguar2->timings =
++					jaguar2_dv_timings[j].timings;
++				break;
++			}
++		}
++
++		dev_info(&client->dev,
++			 "auto-detect: no signal, color bars at fmt=%d (%ux%u)",
++			 def_fmt, jaguar2->frame_size->width,
++			 jaguar2->frame_size->height);
++	}
++
++	return any_detected;
++}
++
+ static int jaguar2_stream(struct v4l2_subdev *sd, int on)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+@@ -531,10 +1018,28 @@
+ 
+ 	if (on) {
+ 		jaguar2_set_mclk(JAGUAR1_MCLK_1242MHZ);
++
++		/*
++		 * Do NOT auto-detect format here.  s_stream is called
++		 * AFTER CIF DMA is already running. Format probing at
++		 * this point generates hundreds of thousands of CSI
++		 * SIZE_ERR interrupts (MIPI TX in reset during probe)
++		 * which permanently stalls the CIF DMA engine.
++		 *
++		 * Instead, start immediately with the default/forced
++		 * format (producing color bars on no-signal channels).
++		 * The workqueue will auto-detect camera formats via
++		 * cross-format probing with proper arbiter control.
++		 */
++
+ 		fmt_idx = jaguar2->frame_size->fmt_idx;
+ 		for (ch = 0; ch < 4; ch++) {
++			u8 ch_fmt = jaguar2->ch_state[ch].active_fmt;
++
+ 			video_init.ch_param[ch].ch = ch;
+-			video_init.ch_param[ch].format = fmt_idx;
++			video_init.ch_param[ch].format =
++				(ch_fmt != NC_VIVO_CH_FORMATDEF_UNKNOWN)
++					? ch_fmt : fmt_idx;
+ 			video_init.ch_param[ch].input = SINGLE_ENDED;
+ 			video_init.ch_param[ch].interface = YUV_422;
+ 		}
+@@ -542,6 +1047,8 @@
+ #ifdef WORK_QUEUE
+ 		jaguar2->hot_plug = false;
+ 		jaguar2->is_reset = 0;
++		jaguar2->novid_persist = 0;
++		jaguar2->cross_format_done = false;
+ 		usleep_range(20000, 21000);
+ 		/* get power on state first*/
+ 		jaguar2_no_signal(sd, &jaguar2->last_detect_status);
+@@ -682,6 +1189,7 @@
+ 	u8 novid_status = 0x00;
+ 	u8 sync_status = 0x00;
+ 	u8 returned;
++	bool cross_format_probe = false;
+ 	int ch;
+ 
+ 	down(&jaguar2->reg_sem);
+@@ -698,6 +1206,46 @@
+ 		jaguar2->hot_plug = false;
+ 	/* Channels that transitioned from no-video to video-present */
+ 	returned = jaguar2->last_detect_status & ~jaguar2->cur_detect_status;
++
++	/*
++	 * Periodic cross-format probe: NOVID detection is format-class
++	 * dependent. When the decoder is configured for AHD, it cannot
++	 * detect CVBS signals via NOVID (and vice versa). Passive sync
++	 * register monitoring doesn't reliably distinguish real signals
++	 * from idle noise across format classes.
++	 *
++	 * When streaming with all channels showing no-video for 3 seconds
++	 * (30 poll cycles at 100ms), actively probe all channels by
++	 * trying each supported format. Cooldown of 10s after probing.
++	 */
++	if (jaguar2->streaming && !returned) {
++		if (jaguar2->cur_detect_status == 0x0f &&
++		    !jaguar2->cross_format_done) {
++			jaguar2->novid_persist++;
++			if (jaguar2->novid_persist >= 30) {
++				/*
++				 * All no-video for 3s at stream start:
++				 * probe all formats once to detect cameras
++				 * in a different format class (e.g. CVBS
++				 * when configured for AHD).  Only runs once
++				 * per stream — subsequent disconnects keep
++				 * the current format to avoid disruption.
++				 */
++				returned = 0x0f;
++				cross_format_probe = true;
++				jaguar2->cross_format_done = true;
++				dev_info(&client->dev,
++					 "cross-format probe: all novid for 3s, probing");
++			}
++		} else {
++			/* At least one channel has video, reset counter */
++			jaguar2->novid_persist = 0;
++		}
++	} else if (returned) {
++		/* Normal hotplug detected, reset counter */
++		jaguar2->novid_persist = 0;
++	}
++
+ 	dev_info_ratelimited(&client->dev,
+ 		"plug_poll: novid=0x%02x last=0x%02x ret=0x%02x stream=%d",
+ 		jaguar2->cur_detect_status, jaguar2->last_detect_status,
+@@ -711,20 +1259,294 @@
+ 	if (returned && jaguar2->streaming) {
+ 		/*
+ 		 * Video returned on at least one channel. Let the analog
+-		 * front-end stabilize, then re-run the full per-channel
+-		 * init sequence (AFE, format, timing, EQ, arbiter).
++		 * front-end stabilize, then probe the format by trying
++		 * each supported type and checking for sync lock.
++		 *
++		 * Format probing uses jaguar2_probe_format() which only
++		 * touches decoder registers (no MIPI/arbiter).  The
++		 * arbiter is only disabled when jaguar2_reinit_channel()
++		 * is actually needed (same-resolution format change).
+ 		 */
+ 		msleep(150);
++
+ 		for (ch = 0; ch < 4; ch++) {
++			u8 use_fmt;
++			u16 det_w = 0, det_h = 0;
++			bool resolution_changed = false;
++
+ 			if (!(returned & (1 << ch)))
+ 				continue;
+-			dev_info(&client->dev,
+-				 "hotplug reinit ch%d fmt=%d",
+-				 ch, jaguar2->frame_size->fmt_idx);
+-			jaguar2_reinit_channel(ch,
+-					       jaguar2->frame_size->fmt_idx,
+-					       SINGLE_ENDED);
++
++			/* Bail out if stream stopped during probe */
++			if (!jaguar2->streaming)
++				break;
++
++			/*
++			 * Format auto-detect via probing: try each format
++			 * on this channel, check nosig/sync for signal lock.
++			 * Try previous format first (most likely on reconnect).
++			 */
++			if (jaguar2->ch_state[ch].force_fmt &&
++			    !cross_format_probe) {
++				/*
++				 * NOVID-detected channel with forced format:
++				 * same format class, just reconnected.
++				 */
++				use_fmt = jaguar2->ch_state[ch].active_fmt;
++				dev_info(&client->dev,
++					 "hotplug ch%d: forced fmt=%d",
++					 ch, use_fmt);
++			} else {
++				int pi;
++				u8 nosig, sync_v, hperiod;
++				u8 prev_fmt = jaguar2->ch_state[ch].active_fmt;
++				bool found = false;
++
++				/*
++				 * Disable arbiter during format probing:
++				 * probe_format reconfigures the decoder which
++				 * changes MIPI TX output timing.  Without
++				 * disabling the arbiter, CIF receives wrong-
++				 * sized frames → CSI_SIZE_ERR flood.
++				 */
++				down(&jaguar2_lock);
++				arb_disable2(0);
++				up(&jaguar2_lock);
++
++				/*
++				 * Try previous format first - most reconnects
++				 * are the same camera type.
++				 */
++				jaguar2_probe_format(ch, prev_fmt,
++						     SINGLE_ENDED);
++				msleep(200);
++				down(&jaguar2_lock);
++				gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF,
++					       0x00);
++				nosig = gpio_i2c_read(jaguar2_i2c_addr[0],
++						      0xA0);
++				sync_v = gpio_i2c_read(jaguar2_i2c_addr[0],
++						       0xD0 + ch);
++				hperiod = gpio_i2c_read(jaguar2_i2c_addr[0],
++							0xD8 + ch);
++				up(&jaguar2_lock);
++
++				if (nosig != 0xFA && sync_v != 0xFA &&
++				    !(nosig & (1 << ch)) && sync_v &&
++				    hperiod) {
++					use_fmt = prev_fmt;
++					found = true;
++					dev_info(&client->dev,
++						 "hotplug ch%d: prev fmt=%d OK",
++						 ch, prev_fmt);
++				}
++
++				/* Probe other formats if previous didn't match */
++				if (!found) {
++					int nosig_streak = 0;
++
++					for (pi = 0;
++					     pi < ARRAY_SIZE(jaguar2_probe_order);
++					     pi++) {
++						int idx = jaguar2_probe_order[pi];
++						u8 fmt = jaguar2_dv_timings[idx].fmt_idx;
++
++						if (fmt == prev_fmt)
++							continue; /* already tried */
++
++						/* Bail if stream stopped during probe */
++						if (!jaguar2->streaming)
++							break;
++
++						jaguar2_probe_format(ch, fmt,
++								     SINGLE_ENDED);
++						msleep(200);
++
++						down(&jaguar2_lock);
++						gpio_i2c_write(jaguar2_i2c_addr[0],
++							       0xFF, 0x00);
++						nosig = gpio_i2c_read(
++							jaguar2_i2c_addr[0],
++							0xA0);
++						sync_v = gpio_i2c_read(
++							jaguar2_i2c_addr[0],
++							0xD0 + ch);
++						hperiod = gpio_i2c_read(
++							jaguar2_i2c_addr[0],
++							0xD8 + ch);
++						up(&jaguar2_lock);
++
++						if (nosig == 0xFA ||
++						    sync_v == 0xFA)
++							continue;
++
++						if (!(nosig & (1 << ch)) &&
++						    sync_v && hperiod) {
++							use_fmt = fmt;
++							found = true;
++							dev_info(&client->dev,
++								 "hotplug ch%d: detected %s",
++								 ch,
++								 jaguar2_dv_timings[idx].name);
++							break;
++						}
++
++						/*
++						 * Skip nosig_streak early-exit
++						 * in cross-format mode: NOVID
++						 * is unreliable across classes.
++						 */
++						if (!cross_format_probe) {
++							if (nosig & (1 << ch))
++								nosig_streak++;
++							else
++								nosig_streak = 0;
++							if (nosig_streak >= 2)
++								break;
++						}
++					}
++				}
++
++				if (!found) {
++					use_fmt = jaguar2->frame_size->fmt_idx;
++					/*
++					 * Restore decoder to default format:
++					 * probing left it configured for the
++					 * last tried format.  Without this,
++					 * color bars render at wrong resolution.
++					 */
++					jaguar2_probe_format(ch, use_fmt,
++							     SINGLE_ENDED);
++					dev_info(&client->dev,
++						 "hotplug ch%d: no fmt detected, fallback=%d",
++						 ch, use_fmt);
++				}
++
++				/* Re-enable arbiter after format probing */
++				down(&jaguar2_lock);
++				arb_enable2(0);
++				up(&jaguar2_lock);
++			}
++
++			/*
++			 * Resolution guard: look up width/height of the
++			 * detected format from the DV timings table.
++			 * If resolution differs from the streaming pipeline,
++			 * we cannot reinit the MIPI output (arb_init2 resets
++			 * all VCs) without causing CSI size errors that
++			 * corrupt the rkcif state permanently.
++			 */
++			{
++				int di;
++				for (di = 0;
++				     di < ARRAY_SIZE(jaguar2_dv_timings);
++				     di++) {
++					if (jaguar2_dv_timings[di].fmt_idx ==
++					    use_fmt) {
++						det_w = jaguar2_dv_timings[di]
++							.timings.bt.width;
++						det_h = jaguar2_dv_timings[di]
++							.timings.bt.height;
++						break;
++					}
++				}
++			}
++			if (det_w && det_h &&
++			    (det_w != jaguar2->frame_size->width ||
++			     det_h != jaguar2->frame_size->height)) {
++				resolution_changed = true;
++			}
++
++			if (use_fmt == jaguar2->ch_state[ch].active_fmt &&
++			    !resolution_changed) {
++				/*
++				 * No change — decoder already configured
++				 * for this format.  Skip entirely to avoid
++				 * unnecessary I2C writes that can corrupt
++				 * the GPIO I2C bus on false-positive hotplug
++				 * events (noise on empty BNC inputs).
++				 */
++				dev_dbg(&client->dev,
++					"hotplug ch%d: no change, skip reinit",
++					ch);
++				continue;
++			}
++
++			if (resolution_changed) {
++				/*
++				 * Different resolution detected while streaming.
++				 * Restore decoder to streaming format (no MIPI
++				 * or arbiter touch) and fire SOURCE_CHANGE so
++				 * the application can restart at new resolution.
++				 */
++				dev_info(&client->dev,
++					 "hotplug ch%d: resolution change %ux%u->%ux%u, need stream restart",
++					 ch, jaguar2->frame_size->width,
++					 jaguar2->frame_size->height,
++					 det_w, det_h);
++
++				jaguar2->ch_state[ch].detected_fmt = use_fmt;
++				jaguar2_probe_format(ch,
++					jaguar2->frame_size->fmt_idx,
++					SINGLE_ENDED);
++
++				{
++					static const struct v4l2_event ev = {
++						.type = V4L2_EVENT_SOURCE_CHANGE,
++						.u.src_change.changes =
++							V4L2_EVENT_SRC_CH_RESOLUTION,
++					};
++					v4l2_subdev_notify_event(sd, &ev);
++				}
++			} else {
++				/*
++				 * Same resolution, different format.
++				 * Disable arbiter, reinit MIPI, re-enable.
++				 * Arbiter is only disabled here (not at the
++				 * top of the hotplug block) to avoid starving
++				 * CIF on false-positive hotplug events.
++				 */
++				dev_info(&client->dev,
++					 "hotplug reinit ch%d fmt=%d (prev=%d)",
++					 ch, use_fmt,
++					 jaguar2->ch_state[ch].active_fmt);
++
++				down(&jaguar2_lock);
++				arb_disable2(0);
++				up(&jaguar2_lock);
++
++				jaguar2_reinit_channel(ch, use_fmt,
++						       SINGLE_ENDED);
++
++				down(&jaguar2_lock);
++				arb_enable2(0);
++				up(&jaguar2_lock);
++
++				{
++					static const struct v4l2_event ev = {
++						.type = V4L2_EVENT_SOURCE_CHANGE,
++						.u.src_change.changes =
++							V4L2_EVENT_SRC_CH_RESOLUTION,
++					};
++					v4l2_subdev_notify_event(sd, &ev);
++				}
++				jaguar2->ch_state[ch].active_fmt = use_fmt;
++			}
+ 		}
++
++		/*
++		 * Re-enable NOVID detection after format probing.
++		 * Arbiter disable/enable is now per-channel around
++		 * jaguar2_reinit_channel() calls only.
++		 */
++		if (jaguar2->streaming) {
++			down(&jaguar2_lock);
++			gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++			for (ch = 0; ch < 4; ch++)
++				gpio_i2c_write(jaguar2_i2c_addr[0],
++					       0x18 + ch, 0x13);
++			up(&jaguar2_lock);
++		}
+ 		jaguar2->is_reset = 1;
+ 		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+ 				   &jaguar2->plug_state_check.d_work,
+@@ -760,6 +1582,25 @@
+ 				 active_en, jaguar2_active);
+ 		}
+ 	} else {
++		/* Motion detection polling */
++		if (jaguar2->md_enabled && jaguar2->streaming) {
++			u8 md_status;
++
++			down(&jaguar2_lock);
++			gpio_i2c_write(jaguar2_i2c_addr[0], 0xFF, 0x00);
++			md_status = gpio_i2c_read(jaguar2_i2c_addr[0], 0xA1);
++			up(&jaguar2_lock);
++
++			if (md_status & 0x0F) {
++				struct v4l2_event ev = {
++					.type = V4L2_EVENT_MOTION_DET,
++				};
++				ev.u.motion_det.flags =
++					V4L2_EVENT_MD_FL_HAVE_FRAME_SEQ;
++				ev.u.motion_det.region_mask = md_status & 0x0F;
++				v4l2_subdev_notify_event(sd, &ev);
++			}
++		}
+ 		queue_delayed_work(jaguar2->plug_state_check.state_check_wq,
+ 				   &jaguar2->plug_state_check.d_work,
+ 				   msecs_to_jiffies(100));
+@@ -937,6 +1778,213 @@
+ 	return 0;
+ }
+ 
++/* ---- DV Timings ops ---- */
++
++static int jaguar2_query_dv_timings(struct v4l2_subdev *sd,
++				    struct v4l2_dv_timings *timings)
++{
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++
++	mutex_lock(&jaguar2->mutex);
++	if (jaguar2_auto_detect_format(jaguar2)) {
++		*timings = jaguar2->timings;
++		mutex_unlock(&jaguar2->mutex);
++		return 0;
++	}
++	mutex_unlock(&jaguar2->mutex);
++	return -ENOLINK;
++}
++
++static int jaguar2_g_dv_timings(struct v4l2_subdev *sd,
++				struct v4l2_dv_timings *timings)
++{
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++
++	mutex_lock(&jaguar2->mutex);
++	*timings = jaguar2->timings;
++	mutex_unlock(&jaguar2->mutex);
++
++	return 0;
++}
++
++static int jaguar2_s_dv_timings(struct v4l2_subdev *sd,
++				struct v4l2_dv_timings *timings)
++{
++	struct jaguar2 *jaguar2 = to_jaguar2(sd);
++	struct i2c_client *client = jaguar2->client;
++	int i, ch;
++
++	mutex_lock(&jaguar2->mutex);
++
++	if (jaguar2->streaming) {
++		mutex_unlock(&jaguar2->mutex);
++		return -EBUSY;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(jaguar2_dv_timings); i++) {
++		if (v4l2_match_dv_timings(timings,
++					  &jaguar2_dv_timings[i].timings,
++					  250000, false)) {
++			int j;
++
++			*timings = jaguar2_dv_timings[i].timings;
++			jaguar2->timings = *timings;
++
++			/* Update per-channel state to forced format */
++			for (ch = 0; ch < 4; ch++) {
++				jaguar2->ch_state[ch].active_fmt =
++					jaguar2_dv_timings[i].fmt_idx;
++				jaguar2->ch_state[ch].force_fmt = true;
++			}
++
++			/*
++			 * Update frame_size and mbus format to match the
++			 * DV timings so get_fmt/set_fmt/s_stream use the
++			 * correct resolution.
++			 */
++			for (j = 0; j < ARRAY_SIZE(jaguar2_framesizes); j++) {
++				if (jaguar2_framesizes[j].fmt_idx ==
++				    jaguar2_dv_timings[i].fmt_idx) {
++					jaguar2->frame_size =
++						&jaguar2_framesizes[j];
++					break;
++				}
++			}
++			jaguar2->format.width =
++				jaguar2->frame_size->width;
++			jaguar2->format.height =
++				jaguar2->frame_size->height;
++			jaguar2->format.field =
++				jaguar2->frame_size->field;
++
++			dev_info(&client->dev,
++				 "s_dv_timings: forced %s (fmt=%d) %ux%u",
++				 jaguar2_dv_timings[i].name,
++				 jaguar2_dv_timings[i].fmt_idx,
++				 jaguar2->frame_size->width,
++				 jaguar2->frame_size->height);
++
++			mutex_unlock(&jaguar2->mutex);
++
++			/*
++			 * Program the decoder registers so color bars
++			 * and NOVID detection match the new format.
++			 * Must be done outside mutex (probe_format
++			 * takes jaguar2_lock for GPIO I2C).
++			 */
++			for (ch = 0; ch < 4; ch++)
++				jaguar2_probe_format(ch,
++					jaguar2_dv_timings[i].fmt_idx,
++					SINGLE_ENDED);
++
++			return 0;
++		}
++	}
++
++	mutex_unlock(&jaguar2->mutex);
++	return -EINVAL;
++}
++
++static int jaguar2_enum_dv_timings(struct v4l2_subdev *sd,
++				   struct v4l2_enum_dv_timings *timings)
++{
++	if (timings->index >= ARRAY_SIZE(jaguar2_dv_timings))
++		return -EINVAL;
++
++	timings->timings = jaguar2_dv_timings[timings->index].timings;
++	return 0;
++}
++
++static int jaguar2_dv_timings_cap(struct v4l2_subdev *sd,
++				  struct v4l2_dv_timings_cap *cap)
++{
++	*cap = jaguar2_timings_cap;
++	return 0;
++}
++
++/* ---- V4L2 Events ---- */
++
++static int jaguar2_subscribe_event(struct v4l2_subdev *sd,
++				   struct v4l2_fh *fh,
++				   struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_SOURCE_CHANGE:
++		return v4l2_src_change_event_subdev_subscribe(sd, fh, sub);
++	case V4L2_EVENT_CTRL:
++		return v4l2_ctrl_subdev_subscribe_event(sd, fh, sub);
++	case V4L2_EVENT_MOTION_DET:
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	default:
++		return -EINVAL;
++	}
++}
++
++/* ---- Motion Detection Controls ---- */
++
++static int jaguar2_s_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct jaguar2 *jaguar2 =
++		container_of(ctrl->handler, struct jaguar2, ctrl_handler);
++	struct i2c_client *client = jaguar2->client;
++	motion_mode ms;
++	int ch;
++
++	memset(&ms, 0, sizeof(ms));
++	ms.devnum = 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_DETECT_MD_MODE:
++		down(&jaguar2_lock);
++		for (ch = 0; ch < 4; ch++) {
++			ms.ch = ch;
++			if (ctrl->val == V4L2_DETECT_MD_MODE_DISABLED) {
++				ms.set_val = FUNC_OFF;
++				motion_onoff_set2(&ms);
++				jaguar2->md_enabled = false;
++			} else {
++				ms.set_val = FUNC_ON;
++				motion_onoff_set2(&ms);
++				if (ctrl->val == V4L2_DETECT_MD_MODE_GLOBAL) {
++					ms.set_val = 0xFF;
++					motion_pixel_all_onoff_set2(&ms);
++				}
++				jaguar2->md_enabled = true;
++			}
++		}
++		up(&jaguar2_lock);
++		dev_info(&client->dev, "MD mode=%d", ctrl->val);
++		break;
++
++	case V4L2_CID_DETECT_MD_GLOBAL_THRESHOLD:
++		down(&jaguar2_lock);
++		for (ch = 0; ch < 4; ch++) {
++			ms.ch = ch;
++			ms.set_val = ctrl->val;
++			motion_tsen_set2(&ms);
++		}
++		up(&jaguar2_lock);
++		dev_info(&client->dev, "MD threshold=%d", ctrl->val);
++		break;
++
++	case V4L2_CID_JAGUAR2_PSEN:
++		down(&jaguar2_lock);
++		for (ch = 0; ch < 4; ch++) {
++			ms.ch = ch;
++			ms.set_val = ctrl->val;
++			motion_psen_set2(&ms);
++		}
++		up(&jaguar2_lock);
++		dev_info(&client->dev, "MD PSEN=%d", ctrl->val);
++		break;
++
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static void jaguar2_get_module_inf(struct jaguar2 *jaguar2,
+ 				   struct rkmodule_inf *inf)
+ {
+@@ -1148,6 +2184,9 @@
+ 	.g_input_status = jaguar2_g_input_status,
+ 	.s_stream = jaguar2_stream,
+ 	.g_frame_interval = jaguar2_g_frame_interval,
++	.query_dv_timings = jaguar2_query_dv_timings,
++	.g_dv_timings = jaguar2_g_dv_timings,
++	.s_dv_timings = jaguar2_s_dv_timings,
+ };
+ 
+ static const struct v4l2_subdev_pad_ops jaguar2_subdev_pad_ops = {
+@@ -1157,6 +2196,8 @@
+ 	.get_fmt = jaguar2_get_fmt,
+ 	.set_fmt = jaguar2_set_fmt,
+ 	.get_mbus_config = jaguar2_g_mbus_config,
++	.enum_dv_timings = jaguar2_enum_dv_timings,
++	.dv_timings_cap = jaguar2_dv_timings_cap,
+ };
+ 
+ static const struct v4l2_subdev_core_ops jaguar2_core_ops = {
+@@ -1165,6 +2206,8 @@
+ #ifdef CONFIG_COMPAT
+ 	.compat_ioctl32 = jaguar2_compat_ioctl32,
+ #endif
++	.subscribe_event = jaguar2_subscribe_event,
++	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+ };
+ 
+ static const struct v4l2_subdev_ops jaguar2_subdev_ops = {
+@@ -1333,6 +2376,15 @@
+ 	mutex_init(&jaguar2->mutex);
+ 	jaguar2_get_default_format(jaguar2);
+ 
++	/* Initialize per-channel state */
++	for (index = 0; index < 4; index++) {
++		jaguar2->ch_state[index].active_fmt = jaguar2->frame_size->fmt_idx;
++		jaguar2->ch_state[index].detected_fmt = 0;
++		jaguar2->ch_state[index].force_fmt = false;
++		jaguar2->ch_state[index].vfc_raw = 0xFF;
++	}
++	jaguar2->md_enabled = false;
++
+ 	sd = &jaguar2->subdev;
+ 	v4l2_i2c_subdev_init(sd, client, &jaguar2_subdev_ops);
+ 	ret = jaguar2_initialize_controls(jaguar2);
+@@ -1352,7 +2404,8 @@
+ 	}
+ 	sema_init(&jaguar2->reg_sem, 1);
+ #ifdef CONFIG_VIDEO_V4L2_SUBDEV_API
+-	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
++		     V4L2_SUBDEV_FL_HAS_EVENTS;
+ #endif
+ 
+ #if defined(CONFIG_VIDEO_ROCKCHIP_USBACM_CONTROL)
+@@ -1469,7 +2522,9 @@
+ 	return i2c_add_driver(&jaguar2_i2c_driver);
+ }
+ 
+-#ifndef CONFIG_VIDEO_REVERSE_IMAGE
++#ifdef MODULE
++module_init(nvp6324_sensor_mod_init2);
++#elif !defined(CONFIG_VIDEO_REVERSE_IMAGE)
+ device_initcall_sync(nvp6324_sensor_mod_init2);
+ #endif
+ 
